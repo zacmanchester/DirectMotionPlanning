@@ -1,61 +1,52 @@
 include(joinpath(pwd(), "src/direct_policy_optimization/dpo.jl"))
-include(joinpath(@__DIR__, "car_obstacles.jl"))
+include(joinpath(@__DIR__, "pendulum_minimum_time.jl"))
 
-# Additive noise model
-model = Car(3, 2, 3)
-
-function fd(model::Car, x⁺, x, u, w, h, t)
-    midpoint_implicit(model, x⁺, x, u, w, h) - w
-end
+propagate_dynamics(model_ft, rand(model_ft.n), rand(model_ft.m), rand(model_ft.d), h, t)
+propagate_dynamics_jacobian(model_ft, rand(model_ft.n), rand(model_ft.m), rand(model_ft.d), h, t)
 
 # Nominal solution
 X̄, Ū = unpack(Z̄, prob)
 prob_nom = prob.prob
 
 # DPO
-N = 2 * model.n
-D = 2 * model.d
+N = 2 * model_ft.n
+D = 2 * model_ft.d
 
-α = 1.0
 β = 1.0
-γ = 1.0
-δ = 2.5e-2
+δ = 1.0e-3
 
 # initial samples
-x1_sample = resample(x1, Diagonal([1.0; 1.0; 0.1]), 1.0e-1)
+x1_sample = resample(x1, Diagonal([1.0; 1.0]), 1.0e-3)
 
 # mean problem
 prob_mean = trajectory_optimization(
-				model,
+				model_ft,
 				EmptyObjective(),
 				T,
-				h = h,
 				dynamics = false
 				)
 
 # sample problems
 prob_sample = [trajectory_optimization(
-				model,
+				model_ft,
 				EmptyObjective(),
 				T,
-				h = h,
 				xl = state_bounds(model, T, x1 = x1_sample[i])[1],
 				xu = state_bounds(model, T, x1 = x1_sample[i])[2],
 				ul = ul,
 				uu = uu,
 				dynamics = false,
-				con = con_obstacles
 				) for i = 1:N]
 
 # sample objective
-Q = [(t < T ? Diagonal([10.0; 10.0; 1.0])
-	: Diagonal(100.0 * ones(model.n))) for t = 1:T]
-R = [Diagonal(1.0e-1 * ones(model.m)) for t = 1:T-1]
+Q = [(t < T ? Diagonal(10.0 * ones(model_ft.n))
+	: Diagonal(100.0 * ones(model_ft.n))) for t = 1:T]
+R = [Diagonal(1.0e-1 * [1.0; 10.0]) for t = 1:T-1]
 
 obj_sample = sample_objective(Q, R)
-policy = linear_feedback(model.n, model.m)
-dist = disturbances([Diagonal(δ * [1.0; 1.0; 0.1]) for t = 1:T-1])
-sample = sample_params(α, β, γ, T)
+policy = linear_feedback(model_ft.n, model_ft.m - 1)
+dist = disturbances([Diagonal(δ * ones(model_ft.d)) for t = 1:T-1])
+sample = sample_params(β, T)
 
 prob_dpo = dpo_problem(
 	prob_nom, prob_mean, prob_sample,
@@ -65,7 +56,7 @@ prob_dpo = dpo_problem(
 	sample)
 
 # TVLQR policy
-K = tvlqr(model, X̄, Ū, Q, R, h)
+K = tvlqr(model_ft, X̄, Ū, Q, R, 0.0)
 
 z0_dpo = zeros(prob_dpo.num_var)
 z0_dpo[prob_dpo.prob.idx.nom] = pack(X̄, Ū, prob_nom)
@@ -73,16 +64,16 @@ z0_dpo[prob_dpo.prob.idx.mean] = pack(X̄, Ū, prob_nom)
 for i = 1:N
 	z0_dpo[prob_dpo.prob.idx.sample[i]] = pack(X̄, Ū, prob_nom)
 end
-for j = 1:(N + D)
-	z0_dpo[prob_dpo.prob.idx.slack[j]] = vcat(X̄[2:end]...)
-end
 for t = 1:T-1
 	z0_dpo[prob_dpo.prob.idx.policy[prob_dpo.prob.idx.θ[t]]] = vec(copy(K[t]))
 end
 
 include("/home/taylor/.julia/dev/SNOPT7/src/SNOPT7.jl")
-
 # Solve
 Z = solve(prob_dpo, copy(z0_dpo),
-	tol = 1.0e-3, c_tol = 1.0e-3,
-	max_iter = 1000)
+	nlp = :ipopt,
+	tol = 1.0e-3, c_tol = 1.0e-3, #max_iter = 1000,
+	time_limit = 180,
+	mapl = 5)
+
+# NOTE: doesn't work as well with Ipopt
